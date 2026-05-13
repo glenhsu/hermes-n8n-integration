@@ -14,6 +14,8 @@ description: Hermes Agent 透過 REST API 管理 n8n 工作流的完整流程 �
 - 需要建立新的 n8n 工作流
 - 需要查詢工作流狀態、執行歷史
 - n8n browser session 不穩定時，使用 API 方式管理
+- Notion API 回傳 400 validation_error（Select 屬性值不匹配）
+- 需要修改 Notion filter 條件或節點名稱
 
 ## 前置準備
 
@@ -148,7 +150,7 @@ print("✅ Workflow fixed and reactivated!")
 > ⚠️ 每次 PATCH 後 versionId 會變，必須用最新的 versionId 才能 activate。
 > ⚠️ 如果跳過 deactivate 直接 patch，versionId 可能不會更新。**一定要先 deactivate。**
 
-#### 手動觸發驗證
+#### 手動觸發驗證 (含 Telegram 發送確認)
 
 ```python
 # 手動觸發執行（需要指定 trigger node）
@@ -168,10 +170,10 @@ status = json.loads(check["output"])["data"]["status"]
 print(f"Execution {exec_id}: {status}")
 ```
 
-> ⚠️ `/rest/workflows/{id}/run` API 在 n8n 2.19.5 有 bug：
+> ⚠️ /rest/workflows/{id}/run API 在 n8n 2.19.5 有 bug：
 > - 方式 A (`startNodes` + `destinationNode`)：報 `Could not find a node named "undefined"`
 > - 方式 B (`triggerToStartFrom`)：✅ **可以成功建立 execution**
->
+> 
 > 所以一定要用方式 B。
 
 ### 查詢執行歷史與錯誤排查
@@ -198,7 +200,101 @@ elif "Unknown error" in text and "JsTaskRunnerSandbox" in text:
     print("❌ Code Node task runner 崩潰 — 重啟 n8n 或改用 HTTP Request node")
 ```
 
-## ⚠️ 關鍵陷阱彙整
+### 修改工作流內容（節點改名陷阱 + 重建 payload 流程）
+
+**核心原則：只改參數時寧可保留舊名稱，別改名。名稱只是 UI 顯示，不影響行為。**
+
+#### 輕量修改（只改 filter 值、參數）
+
+直接在 `nodes` 陣列中找到目標節點修改即可。**不要動 `name` 欄位。**
+
+```python
+from hermes_tools import terminal
+import json
+
+result = terminal(f"curl -s -b /tmp/n8n_cookies.txt http://localhost:5678/rest/workflows/{WF_ID}", timeout=10)
+wf = json.loads(result['output'])['data']
+
+# 找到目標節點，只改參數
+for node in wf['nodes']:
+    if node['name'] == '查詢待辦任務':
+        # 例：將 select.equals 改為 select.does_not_equal
+        f = node['parameters']['jsonBody']['filter']['select']
+        val = f.pop('equals', None)
+        if val:
+            f['does_not_equal'] = '已完成'
+# 保留 connections 不動
+
+# 用 Python 寫檔，避免 shell 轉義 Unicode
+payload = {'name': wf['name'], 'nodes': wf['nodes'], 'connections': wf['connections'],
+           'settings': wf.get('settings',{}), 'staticData': wf.get('staticData'),
+           'pinData': wf.get('pinData',{}), 'versionId': wf['versionId']}
+with open('/tmp/wf_patch.json', 'w', encoding='utf-8') as f:
+    json.dump(payload, f, ensure_ascii=False)
+```
+
+#### 改名（需要重建整個 payload）
+
+如果**必須改名**（如節點名稱已過時），必須同步更新四處：
+1. `nodes` 陣列中該節點的 `name`
+2. `connections` 中以舊名作為 key 的 output
+3. `connections` 中所有引用舊名的 input（在其他節點的 `main` 陣列中）
+4. 從 `每小時觸發` 這種上游節點的 connections 中也要更新引用
+
+**建議方式**：用 `execute_code` 工具（`from hermes_tools import terminal, ...`）來操作 JSON，避免：
+- Shell 轉義 Unicode/中文失敗
+- JSON payload 太長被截斷
+- `cat > /tmp/xxx.json << 'EOF'` 遇到特殊字符報錯
+
+```python
+# ✅ 推薦：用 execute_code 處理 JSON payload
+from hermes_tools import terminal
+import json
+
+result = terminal(f"curl -s -b /tmp/n8n_cookies.txt http://localhost:5678/rest/workflows/{WF_ID}", timeout=10)
+wf = json.loads(result['output'])['data']
+
+# ... 修改 nodes 和 connections ...
+
+payload = { ... }  # 完整 payload
+with open('/tmp/wf_patch.json', 'w', encoding='utf-8') as f:
+    json.dump(payload, f, ensure_ascii=False)
+```
+
+然後在 terminal 中：
+```bash
+curl -s -b /tmp/n8n_cookies.txt -X PATCH http://localhost:5678/rest/workflows/{WF_ID} \
+  -H 'Content-Type: application/json' \
+  -d @/tmp/wf_patch.json
+```
+
+> ⚠️ `cat > /tmp/file << 'HERMESEOF'` 在處理含中文的 JSON 時容易出錯（shell 轉義、EOF 衝突），改用 Python `json.dump()` 寫檔更可靠。
+
+### Notion API Select 屬性值不匹配
+
+當 n8n workflow 中的 Notion query filter 使用 `select.equals`，但該值不存在於 Notion DB 的 Select 選項中時，Notion API 會回傳 400 `validation_error`：
+
+```
+select option "未開始" not found for property "狀態". Available options: "待開始", "進行中", "已完成", "阻塞".
+```
+
+**解決方法：** 將 filter 中的 `equals` 值改為 Notion DB 中實際存在的選項。
+
+#### 改為排除特定值的 filter
+
+如果是要查「不是已完成」的所有任務，Notion API 支援 `select.does_not_equal`：
+
+```python
+# 從 select.equals 改為 select.does_not_equal
+f = node['parameters']['jsonBody']['filter']['select']
+val = f.pop('equals', None)  # 移除等於
+if val:
+    f['does_not_equal'] = '已完成'  # 改為不等於
+```
+
+這會查詢所有狀態不等於「已完成」的任務（包含待開始、進行中、阻塞等）。
+
+**驗證 Notion DB 的 Select 選項：** 可透過 `POST /v1/databases/{DB_ID}`（不含 query 路徑）的 response 中的 `properties.狀態.select.options` 陣列查看所有可用選項。
 
 | 陷阱 | 症狀 | 解決方案 |
 |------|------|----------|
@@ -206,9 +302,107 @@ elif "Unknown error" in text and "JsTaskRunnerSandbox" in text:
 | 缺少 contentType | body 送空字串 `""` | 設 `contentType: "json"`, `specifyBody: "json"` |
 | activate 沒 versionId | 400 Required | 用最新的 versionId 調用 activate |
 | Cookie 過期 | API 回 401 但不被檢查 | 每次操作前先驗證 |
-| PATCH 後 versionId 沒更新 | activate 失敗 | 必須先 deactivate 再 patch |
+| deactivate 後 versionId 不變但 activate 會失敗 | 404 Version not found | deactivate 後重新 GET workflow 獲取最新 versionId 再 activate |
 | HTTP Request node auth | Found credential with no ID | **不用 credential**，改手動 Header |
 | Manual run API | Cannot read nodeName | 用 `triggerToStartFrom` 方式，不用 `startNodes` |
+| Notion Select 值不匹配 | 400 validation_error | filter 的 `equals` 值須與 Notion DB 實際選項完全一致 |
+| 誤改節點名稱 | connections 引用斷裂，workflow 損壞 | 用 `execute_code` + Python 重構整個 payload（見「節點改名陷阱+重建 payload 流程」） |
+
+### SQLite 直接刪除工作流
+
+當 REST API 無法刪除工作流（鬼影草稿、active=True 工作流拒絕被刪）時，直接操作 SQLite：
+
+```python
+import sqlite3
+
+db = sqlite3.connect("/home/athing/.n8n/database.sqlite")
+
+# 先找出 id
+rows = db.execute("SELECT id, name, active FROM workflow_entity").fetchall()
+for r in rows:
+    print(f"{r[0]} | {r[1]} | active={r[2]}")
+
+# 刪除工作流（必須先清相關表，否則 FK 會報錯）
+TABLES_TO_CLEAR = [
+    "shared_workflow", "workflow_history", "workflow_dependency",
+    "workflow_statistics", "execution_entity", "processed_data",
+    "workflow_publish_history", "workflow_published_version",
+    "workflow_builder_session",
+]
+wid = "目標工作流ID"
+for t in TABLES_TO_CLEAR:
+    try:
+        db.execute(f"DELETE FROM {t} WHERE workflowId = ?", (wid,))
+    except Exception:
+        pass  # 有些表可能不存在
+db.execute("DELETE FROM workflow_entity WHERE id = ?", (wid,))
+db.commit()
+```
+
+> ⚠️ **必做順序：** 先關閉 n8n → 操作 SQLite → 重啟 n8n。中間不要啟動 n8n，否則它會重新註冊 cron。
+
+### CLI 命令
+
+| 操作 | 命令 |
+|------|------|
+| 列表 | `n8n list:workflow` |
+| 發布 | `n8n publish:workflow --id=<id>`（需重啟 n8n 才生效） |
+| 匯出 | `n8n export:workflow --id=<id> --output=<file>` |
+| 匯入 | `n8n import:workflow --input=<file>` |
+
+> ⚠️ `n8n publish:workflow` 後**必須重啟 n8n**，CLI 不支援 `delete:workflow`。
+
+### 工作流 JSON 結構要點
+
+#### Schedule Trigger 參數格式 (v2.19)
+
+```json
+{
+  "rule": {
+    "interval": [
+      {"field": "cronExpression", "expression": "0 * * * *"}
+    ]
+  }
+}
+```
+- `interval` 必須是**陣列**，不是物件！
+- 每小時：`0 * * * *`
+- 每晚 21:00：`0 21 * * *`
+
+#### Telegram Node 參數
+
+```json
+{
+  "resource": "message",
+  "operation": "sendMessage",
+  "chatId": "8781947120",
+  "text": "={{ $json.result }}"
+}
+```
+
+#### 節點連接格式
+
+```json
+{
+  "節點A": {
+    "main": [[{"node": "節點B", "type": "main", "index": 0}]]
+  }
+}
+```
+
+### 一次性建立 + 啟用
+
+建立時直接在 JSON 中加上 `"active": true` 即可免去後續 activate 步驟：
+
+```json
+{
+  "name": "工作流名稱",
+  "nodes": [...],
+  "connections": {...},
+  "active": true,
+  "settings": {"saveManualExecutions": true}
+}
+```
 
 ## 參考
 

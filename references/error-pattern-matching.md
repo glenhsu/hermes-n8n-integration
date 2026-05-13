@@ -19,4 +19,8 @@ elif "Unauthorized" in text:
     print("❌ Cookie 過期 — 重新登入")
 elif "invalid_type" in text or "Required" in text:
     print("❌ API 參數格式錯誤 — 檢查字段名/型別")
+elif "select option" in text and "not found" in text:
+    print("❌ Notion Select 屬性值不匹配 — 檢查 Notion DB 實際選項")
+    print("   → 可透過 GET /v1/databases/{DB_ID} 查詢 Select 屬性的 options")
+    print("   → 或登入 Notion UI 查看該屬性的可選值列表")
 ```

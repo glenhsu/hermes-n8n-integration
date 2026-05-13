@@ -1,6 +1,6 @@
 # 手動觸發 n8n 工作流（REST API）
 
-> n8n 2.19.5 的已知 bug 及 workaround
+> 從 `hermes-n8n-integration` 移入 `n8n` 的 reference
 
 ## 問題
 
